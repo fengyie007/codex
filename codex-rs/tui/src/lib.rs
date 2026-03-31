@@ -29,6 +29,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::load_feedback_enabled_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLoadError;
@@ -40,6 +41,10 @@ use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_feedback::AuthFailureEventQueueFlushGuard;
+use codex_feedback::auth_failure_event_queue_flush_timeout;
+use codex_feedback::enqueue_auth_failure_event_tags;
+use codex_feedback::flush_auth_failure_event_queue_and_exit;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
@@ -637,7 +642,7 @@ pub async fn run_main(
         #[allow(clippy::print_stderr)]
         Err(e) => {
             eprintln!("Error parsing -c overrides: {e}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -647,7 +652,7 @@ pub async fn run_main(
         Ok(codex_home) => codex_home.to_path_buf(),
         Err(err) => {
             eprintln!("Error finding codex home: {err}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -656,6 +661,22 @@ pub async fn run_main(
         Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
         None => AbsolutePathBuf::current_dir()?,
     };
+
+    let feedback_enabled = load_feedback_enabled_with_cli_overrides(
+        &codex_home,
+        Some(config_cwd.as_path().to_path_buf()),
+        &cli_kv_overrides,
+        LoaderOverrides::default(),
+    )
+    .await
+    .unwrap_or(true);
+    let _auth_failure_reporter_guard = feedback_enabled.then(|| {
+        codex_core::auth::set_auth_failure_reporter(std::sync::Arc::new(
+            enqueue_auth_failure_event_tags,
+        ))
+    });
+    let _auth_failure_flush_guard = feedback_enabled
+        .then(|| AuthFailureEventQueueFlushGuard::new(auth_failure_event_queue_flush_timeout()));
 
     #[allow(clippy::print_stderr)]
     let config_toml = match load_config_as_toml_with_cli_overrides(
@@ -679,7 +700,7 @@ pub async fn run_main(
             } else {
                 eprintln!("Error loading config.toml: {err}");
             }
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -769,7 +790,7 @@ pub async fn run_main(
                 "Error loading rules:\n{}",
                 format_exec_policy_error_with_source(&err)
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 
@@ -781,7 +802,7 @@ pub async fn run_main(
         #[allow(clippy::print_stderr)]
         {
             eprintln!("Error adding directories: {warning}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 
@@ -794,7 +815,7 @@ pub async fn run_main(
             forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
         }) {
             eprintln!("{err}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 
@@ -837,12 +858,13 @@ pub async fn run_main(
             tracing_subscriber::fmt::format::FmtSpan::NEW
                 | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
         )
-        .with_filter(env_filter());
+        .with_filter(env_filter())
+        .with_filter(codex_feedback::exclude_auth_failure_events());
 
     let feedback = codex_feedback::CodexFeedback::new();
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let feedback_auth_event_layer = feedback.auth_event_layer();
+    let feedback_auth_event_layer = feedback_enabled.then(|| feedback.auth_event_layer());
 
     if cli.oss && model_provider_override.is_some() {
         // We're in the oss section, so provider_id should be Some
@@ -884,13 +906,21 @@ pub async fn run_main(
         }
     };
 
-    let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
+    let otel_logger_layer = otel
+        .as_ref()
+        .and_then(|o| o.logger_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
 
-    let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
+    let otel_tracing_layer = otel
+        .as_ref()
+        .and_then(|o| o.tracing_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
 
-    let log_db_layer = codex_core::state_db::get_state_db(&config)
-        .await
-        .map(|db| log_db::start(db).with_filter(env_filter()));
+    let log_db_layer = codex_core::state_db::get_state_db(&config).await.map(|db| {
+        log_db::start(db)
+            .with_filter(env_filter())
+            .with_filter(codex_feedback::exclude_auth_failure_events())
+    });
 
     let _ = tracing_subscriber::registry()
         .with(file_layer)
@@ -1608,7 +1638,7 @@ async fn load_config_or_exit_with_fallback_cwd(
         Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 }
